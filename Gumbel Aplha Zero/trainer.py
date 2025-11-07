@@ -140,7 +140,11 @@ def self_play_worker(params_q: Queue, out_q: Queue, device: str, sims: int, g_sc
             if term:
                 z = 0 if outcome == 0 else outcome
                 for obs, pi_h, player in history:
-                    out_q.put(Sample(obs=obs, pi=pi_h, z=float(z * player)))
+                    try:
+                        out_q.put_nowait(Sample(obs=obs, pi=pi_h, z=float(z * player)))
+                    except Full:
+                        # Drop the sample if the queue is congested to keep workers responsive
+                        break
                 break
 
 def _triton_available() -> bool:
@@ -214,9 +218,11 @@ class ReplayBuffer:
         segment = self.tree.total_priority / batch_size
         self.per_beta = min(1.0, self.per_beta + self.per_beta_increment)
 
-        for i in range(batch_size):
-            a, b = segment * i, segment * (i + 1)
-            v = np.random.uniform(a, b)
+        base = segment * np.arange(batch_size, dtype=np.float64)
+        offsets = np.random.uniform(0.0, segment, size=batch_size)
+        sample_points = base + offsets
+
+        for v in sample_points:
             idx, p, data = self.tree.get_leaf(v)
             sampling_prob = p / max(1e-8, self.tree.total_priority)
             
@@ -313,12 +319,6 @@ class Trainer:
         if flip_indices.any():
             obs[flip_indices] = obs[flip_indices][:, :, :, ::-1]
             pi[flip_indices]  = pi[flip_indices][:, ::-1]
-
-        invert_indices = np.random.rand(obs.shape[0]) < 0.5
-        if invert_indices.any():
-            obs[invert_indices] = obs[invert_indices][:, [1, 0, 2, 3], :, :]
-            obs[invert_indices, 2, :, :] = 1.0 - obs[invert_indices, 2, :, :]
-            z[invert_indices] = -z[invert_indices]
 
         return obs, pi, z
 

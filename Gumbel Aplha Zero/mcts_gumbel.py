@@ -12,53 +12,47 @@
 from __future__ import annotations
 import math
 from typing import Dict, List, Optional, Tuple, Set
+from functools import lru_cache
 import numpy as np
 import torch
 import torch.nn as nn
 
-from connect4 import C4State, COLS
+from connect4 import (
+    C4State,
+    COLS,
+    ROWS,
+    COL_MASKS,
+    BOTTOM_MASKS,
+    TOP_MASKS,
+    FULL_TOP_MASK,
+    has_won_numba,
+)
 
 __version__ = "mcts_gumbel 3.2 (true-gumbel-topk + block-in-1 + virtual-loss + depth-decay + stable-temp)"
 
-# =========================
-#   LRU cache leggera
-# =========================
-class _LRU:
-    __slots__ = ("cap", "d")
-    def __init__(self, cap: int = 4096):
-        self.cap = int(cap)
-        self.d: Dict[Tuple[int, int, int, int, int], object] = {}
-    def get(self, k):
-        v = self.d.get(k)
-        if v is not None:
-            self.d.pop(k, None)
-            self.d[k] = v
-        return v
-    def put(self, k, v):
-        if k in self.d:
-            self.d.pop(k, None)
-        elif len(self.d) >= self.cap:
-            # Pop la chiave inserita meno recentemente (prima nell'iteratore)
-            self.d.pop(next(iter(self.d)))
-        self.d[k] = v
+@lru_cache(maxsize=8192)
+def _terminal_lookup(bb0: int, bb1: int, player: int, last_move_bit: int, mask_all: int) -> Tuple[bool, Optional[int]]:
+    last_bb = bb0 if player == -1 else bb1
+    if last_move_bit and has_won_numba(last_bb):
+        return True, -player
+    if (mask_all & FULL_TOP_MASK) == FULL_TOP_MASK:
+        return True, 0
+    return False, None
 
-def _norm_int(x, default: int = -1) -> int:
-    """Converte in int gestendo None e tipi numpy. Ritorna `default` se fallisce."""
-    if x is None:
-        return default
-    try:
-        return int(x)
-    except Exception:
-        return default
 
-def _state_key(s: C4State) -> Tuple[int, int, int, int, int]:
-    """Chiave robusta per caching: include solo elementi deterministici dello stato."""
-    bb0 = _norm_int(getattr(s, "bb", [0, 0])[0], 0)
-    bb1 = _norm_int(getattr(s, "bb", [0, 0])[1], 0)
-    player = _norm_int(getattr(s, "player", 0), 0)
-    last_move_bit = _norm_int(getattr(s, "last_move_bit", None), -1)  # può essere None all'inizio
-    ply = _norm_int(getattr(s, "ply", 0), 0)
-    return (bb0, bb1, player, last_move_bit, ply)
+@lru_cache(maxsize=8192)
+def _threats_lookup(cur_bb: int, mask_all: int) -> Tuple[int, ...]:
+    threats: List[int] = []
+    for a in range(COLS):
+        if mask_all & TOP_MASKS[a]:
+            continue
+        move_bit = (mask_all + BOTTOM_MASKS[a]) & COL_MASKS[a]
+        if move_bit == 0:
+            continue
+        if has_won_numba(cur_bb | move_bit):
+            threats.append(a)
+    return tuple(threats)
+
 
 # =========================
 #   Nodo dell'albero
@@ -117,8 +111,6 @@ class GumbelMCTS:
 
         # RNG & cache
         self.rng = np.random.default_rng(rng_seed)
-        self._terminal_cache = _LRU(cache_size)
-        self._win1_cache = _LRU(cache_size)
         self._avoid_lose_depth = int(avoid_lose_depth)
 
         # <--- MODIFICATO: Salvataggio dei nuovi parametri di penalità ---
@@ -143,37 +135,19 @@ class GumbelMCTS:
             self.root = None
 
     # ---------- Tattiche & cache ----------
-    def _terminal_cached(self, s: C4State) -> Tuple[bool, int]:
-        k = _state_key(s)
-        v = self._terminal_cache.get(k)
-        if v is not None:
-            return v  # (term, outcome)
-        term, outcome = s.terminal()
-        self._terminal_cache.put(k, (term, outcome))
-        return term, outcome
+    def _terminal_cached(self, s: C4State) -> Tuple[bool, Optional[int]]:
+        last_move_bit = s.last_move_bit or 0
+        return _terminal_lookup(s.bb[0], s.bb[1], s.player, last_move_bit, s.mask_all)
     
     # <--- MODIFICATO: Nuova funzione _get_opponent_threats ---
     def _get_opponent_threats(self, s_with_opp_to_move: C4State) -> List[int]:
         """
         Trova TUTTE le mosse vincenti in 1 per il giocatore che muove nello stato 's'.
-        Usa la cache _threats_cache.
         """
-        k = _state_key(s_with_opp_to_move)
-        v = self._win1_cache.get(k)
-        if v is not None:
-            return v  # Ritorna la lista di minacce [int]
-        
-        threats: List[int] = []
-        legal = s_with_opp_to_move.legal_actions()
-        for a in legal:
-            s2 = s_with_opp_to_move.apply(a)
-            # Controlla se il giocatore che ha mosso (s_with_opp_to_move.player) ha vinto
-            term, outcome = self._terminal_cached(s2)
-            if term and outcome == s_with_opp_to_move.player:
-                threats.append(a)
-        
-        self._win1_cache.put(k, threats)
-        return threats
+        cur_idx = 0 if s_with_opp_to_move.player == 1 else 1
+        cur_bb = s_with_opp_to_move.bb[cur_idx]
+        threats = _threats_lookup(cur_bb, s_with_opp_to_move.mask_all)
+        return list(threats)
 
     # <--- MODIFICATO: _win_in_one ora usa la nuova funzione ---
     def _win_in_one(self, s: C4State) -> Optional[int]:
@@ -278,7 +252,9 @@ class GumbelMCTS:
                 continue
 
             # EVAL (batch)
-            obs = np.stack([s.to_planes() for s in pending_states], dtype=np.float32)
+            obs = np.empty((len(pending_states), 4, ROWS, COLS), dtype=np.float32)
+            for i, s in enumerate(pending_states):
+                obs[i] = s.to_planes()
             obs_t = torch.from_numpy(obs).to(self.device)
             logits, values = self.model(obs_t)
             pol_np = torch.softmax(logits, dim=1).cpu().numpy()
@@ -330,27 +306,28 @@ class GumbelMCTS:
         # --- POLICY da visite (stabile numericamente) ---
         pi = np.zeros(COLS, dtype=np.float32)
         if root and root.children:
-            visits = np.array(
-                [root.children[a].N if a in root.children else 0.0 for a in range(COLS)],
-                dtype=np.float64
-            )
+            legal = list(root.children.keys())
+            visits = np.array([root.children[a].N for a in legal], dtype=np.float64)
             total_visits = float(visits.sum())
 
             if total_visits <= 0.0:
-                # fallback ai prior
-                pri = np.array(
-                    [root.children[a].prior if a in root.children else 0.0 for a in range(COLS)],
-                    dtype=np.float64
-                )
+                pri = np.array([root.children[a].prior for a in legal], dtype=np.float64)
                 s = float(pri.sum())
-                pi = (pri / s).astype(np.float32) if s > 0.0 else np.full(COLS, 1.0 / COLS, np.float32)
+                if s > 0.0:
+                    pri /= s
+                else:
+                    pri = np.full(len(legal), 1.0 / len(legal), dtype=np.float64)
+                for idx, a in enumerate(legal):
+                    pi[a] = float(pri[idx])
             else:
                 T = float(temperature)
                 if T <= 1e-8:
-                    a_star = int(np.argmax(visits))
+                    a_star = int(legal[int(np.argmax(visits))])
                     pi[a_star] = 1.0
                 elif abs(T - 1.0) < 1e-6:
-                    pi = (visits / total_visits).astype(np.float32, copy=False)
+                    probs = visits / total_visits
+                    for idx, a in enumerate(legal):
+                        pi[a] = float(probs[idx])
                 else:
                     eps = 1e-12
                     logits = np.log(visits + eps) / T
@@ -358,9 +335,11 @@ class GumbelMCTS:
                     probs = np.exp(logits)
                     s = float(probs.sum())
                     if not np.isfinite(s) or s <= 0.0:
-                        pi = (visits / total_visits).astype(np.float32, copy=False)
+                        probs = visits / total_visits
                     else:
-                        pi = (probs / s).astype(np.float32, copy=False)
+                        probs /= s
+                    for idx, a in enumerate(legal):
+                        pi[a] = float(probs[idx])
 
         root_value = root.Q if root else 0.0
         return pi, float(root_value)

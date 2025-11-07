@@ -113,7 +113,11 @@ def evaluate_agent(trainer: Trainer, games: int, sims: int, temperature: float,
         trans[key] = value; return value
 
     def choose_minimax_action(state: C4State) -> int:
-        legal = state.legal_actions(); rng.shuffle(legal); player = state.player
+        legal = list(state.legal_actions())
+        if len(legal) > 1:
+            order = rng.permutation(len(legal))
+            legal = [legal[i] for i in order]
+        player = state.player
         best_score, best_moves = -1e9, []; trans = {}
         for action in legal:
             next_state = state.apply(action)
