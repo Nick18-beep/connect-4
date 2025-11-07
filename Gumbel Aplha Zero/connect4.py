@@ -19,6 +19,25 @@ SHIFT_D2 = H + 2      # diagonal \ (8)
 COL_MASKS    = [(((1 << H) - 1) << (c * (H + 1))) for c in range(COLS)]
 BOTTOM_MASKS = [(1 << (c * (H + 1))) for c in range(COLS)]
 TOP_MASKS    = [(1 << (c * (H + 1) + (H - 1))) for c in range(COLS)]
+FULL_TOP_MASK = 0
+for _mask in TOP_MASKS:
+    FULL_TOP_MASK |= _mask
+
+
+def _bit_to_coords(bit: int) -> Tuple[int, int]:
+    pos = bit.bit_length() - 1
+    col = pos // (H + 1)
+    row_bot = pos % (H + 1)
+    return (H - 1 - row_bot, col)
+
+
+def _fill_plane_from_bits(bb: int, plane: np.ndarray) -> None:
+    bits = bb
+    while bits:
+        bit = bits & -bits
+        row, col = _bit_to_coords(bit)
+        plane[row, col] = 1.0
+        bits ^= bit
 
 
 @njit(cache=True, inline='always')
@@ -40,13 +59,16 @@ class C4State:
     bb[0] -> player +1 stones, bb[1] -> player -1 stones.
     player -> side to move (+1 or -1).
     """
-    __slots__ = ("bb", "player", "last_move_bit", "ply")
+    __slots__ = ("bb", "player", "last_move_bit", "ply", "mask_all")
 
-    def __init__(self, bb0: int = 0, bb1: int = 0, player: int = 1, last_move_bit: Optional[int] = None, ply: int = 0):
-        self.bb = [int(bb0), int(bb1)]
+    def __init__(self, bb0: int = 0, bb1: int = 0, player: int = 1,
+                 last_move_bit: Optional[int] = None, ply: int = 0):
+        bb0 = int(bb0); bb1 = int(bb1)
+        self.bb = [bb0, bb1]
         self.player = 1 if player >= 0 else -1
         self.last_move_bit = last_move_bit  # int mask or None
         self.ply = int(ply)
+        self.mask_all = bb0 | bb1
 
     @staticmethod
     def initial() -> "C4State":
@@ -59,25 +81,20 @@ class C4State:
     def board(self) -> List[List[int]]:
         """Top-to-bottom 6x7 grid view (for printing / legacy compatibility)."""
         grid = [[0 for _ in range(COLS)] for _ in range(ROWS)]
-        for c in range(COLS):
-            base = c * (H + 1)
-            for r_bot in range(H):  # 0 bottom .. H-1 top
-                bit = 1 << (base + r_bot)
-                r_top = H - 1 - r_bot
-                if self.bb[0] & bit:
-                    grid[r_top][c] = 1
-                elif self.bb[1] & bit:
-                    grid[r_top][c] = -1
+        for idx, bb in enumerate(self.bb):
+            bits = bb
+            val = 1 if idx == 0 else -1
+            while bits:
+                bit = bits & -bits
+                row, col = _bit_to_coords(bit)
+                grid[row][col] = val
+                bits ^= bit
         return grid
 
     def legal_actions(self) -> List[int]:
         """List of columns where the top playable cell is empty."""
-        legal = []
-        mask_all = self.bb[0] | self.bb[1]
-        for c in range(COLS):
-            if (mask_all & TOP_MASKS[c]) == 0:
-                legal.append(c)
-        return legal
+        mask_all = self.mask_all
+        return [c for c in range(COLS) if (mask_all & TOP_MASKS[c]) == 0]
 
     def _lowest_empty_bit(self, mask_all: int, col: int) -> int:
         """Return bitmask of lowest empty cell in column, or 0 if full."""
@@ -86,17 +103,16 @@ class C4State:
     def apply(self, action: int) -> "C4State":
         """Drop a piece in column `action` and return the next state."""
         c = int(action)
-        mask_all = self.bb[0] | self.bb[1]
+        mask_all = self.mask_all
         move_bit = self._lowest_empty_bit(mask_all, c)
         if move_bit == 0:
             raise ValueError(f"Illegal move on full column {c}")
-        next_state = self.clone()
-        idx = 0 if self.player == 1 else 1
-        next_state.bb[idx] |= move_bit
-        next_state.player = -self.player
-        next_state.last_move_bit = move_bit
-        next_state.ply += 1
-        return next_state
+        bb0, bb1 = self.bb
+        if self.player == 1:
+            bb0 |= move_bit
+        else:
+            bb1 |= move_bit
+        return C4State(bb0, bb1, -self.player, move_bit, self.ply + 1)
 
     def _has_won(self, bb: int) -> bool:
         return has_won_numba(bb)
@@ -108,39 +124,28 @@ class C4State:
             if self._has_won(self.bb[last_idx]):
                 return True, -self.player
         # check draw
-        mask_all = self.bb[0] | self.bb[1]
-        for c in range(COLS):
-            if (mask_all & TOP_MASKS[c]) == 0:
-                return False, None
-        return True, 0
+        if (self.mask_all & FULL_TOP_MASK) == FULL_TOP_MASK:
+            return True, 0
+        return False, None
 
     
     def to_planes(self) -> np.ndarray:
         """Return (C,H,W) float32 planes: [cur, opp, to_play, last_move]."""
         cur_idx = 0 if self.player == 1 else 1
         opp_idx = 1 - cur_idx
-        cur = np.zeros((ROWS, COLS), dtype=np.float32)
-        opp = np.zeros((ROWS, COLS), dtype=np.float32)
-        for c in range(COLS):
-            base = c * (H + 1)
-            for r_bot in range(H):
-                bit = 1 << (base + r_bot)
-                r_top = H - 1 - r_bot
-                if self.bb[cur_idx] & bit:
-                    cur[r_top, c] = 1.0
-                elif self.bb[opp_idx] & bit:
-                    opp[r_top, c] = 1.0
+        planes = np.zeros((4, ROWS, COLS), dtype=np.float32)
+        cur_plane, opp_plane, to_play_plane, last_plane = planes
 
-        to_play = np.full((ROWS, COLS), 1.0 if self.player == 1 else 0.0, dtype=np.float32)
-        last = np.zeros((ROWS, COLS), dtype=np.float32)
+        _fill_plane_from_bits(self.bb[cur_idx], cur_plane)
+        _fill_plane_from_bits(self.bb[opp_idx], opp_plane)
+
+        to_play_plane.fill(1.0 if self.player == 1 else 0.0)
+
         if self.last_move_bit:
-            pos = (self.last_move_bit.bit_length() - 1)
-            c = pos // (H + 1)
-            r_bot = pos % (H + 1)
-            if r_bot < H:
-                r_top = H - 1 - r_bot
-                last[r_top, c] = 1.0
-        return np.stack([cur, opp, to_play, last], axis=0).astype(np.float32)
+            row, col = _bit_to_coords(self.last_move_bit)
+            last_plane[row, col] = 1.0
+
+        return planes
 
     def hash_key(self) -> Tuple[int, int, int]:
         return (self.bb[0], self.bb[1], self.player)
